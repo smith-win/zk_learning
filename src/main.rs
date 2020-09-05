@@ -2,6 +2,8 @@
 extern crate log;
 extern crate env_logger;
 
+#[macro_use]
+extern crate lazy_static;
 extern crate zookeeper;
 
 use std::time::Duration;
@@ -18,10 +20,9 @@ fn main() {
     info!("My rust zookeeper client is starting");
 
 
-    let cluster = Cluster::new("my_cool_cluster");
-
-    info!("I joined cluster with id {}", cluster.client_id);
-
+    // This does not return anything, .. 
+    // TODO: consider builder pattern here / re-try if ZK unavailable etc etc
+    Cluster::new("my_cool_cluster");
 
     for i in 1..20 {
         info!("main thread sleeping... {}",i);

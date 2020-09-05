@@ -3,7 +3,7 @@
 
 
 use std::time::Duration;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::str::FromStr;
 use zookeeper::{ZooKeeper, Watcher, WatchedEvent, CreateMode, Acl, ZkError, WatchedEventType};
 
@@ -29,13 +29,19 @@ use zookeeper::{ZooKeeper, Watcher, WatchedEvent, CreateMode, Acl, ZkError, Watc
 //     NewLeader
 // }
 
+// Callbacks from watches require static scope, we use this singleton to
+// hold a singleton
+lazy_static! {
+    static ref CLUSTER : Arc<Mutex<Option<Cluster>>> = Arc::new(Mutex::new(None));
+}
+
 pub struct Cluster {
 
     /// Zookeeper path for the node for our cluster
     zk_path: String,
 
     /// Zk instance used
-    zk: Arc<ZooKeeper>,
+    zk: ZooKeeper,
 
     pub client_id: u32
 
@@ -57,24 +63,12 @@ impl Watcher for LoggingWatcher {
 }
 
 
-/// Just messing around with ZK impl and its need for static lifetime
-impl LoggingWatcher {
-
-    fn cluster_member_node(_e: WatchedEvent) {
-        println!("All hell breaks loose");
-    }
-
-
-}
-
-
 impl Cluster {
 
     // TODO: configurable address, timeout option, application (logical cluster name)
-    /// Creates a new instance, returns an Arc to it
-
-
-    pub fn new(cluster: &str ) -> Cluster {
+    // TODO: should get a result
+    /// Creates a new instance, returns an Arc to it - so it can be used
+    pub fn new(cluster: &str ) {
         debug!("{:?} Attemping to join cluster [{}]",std::thread::current().name(), &cluster);
 
         // TODO: we want to manage this as part of "Cluster" code - run asynchronously ?  Use calls
@@ -96,11 +90,6 @@ impl Cluster {
             info!("Node {} did not already exist and created succesfully", path);
         }        
         
-        // emit_status(Joining)
-
-        let zk = Arc::new(zk);
-        // Self::restart_watch_children(None, zk.clone());
-        // Ok, now we set 
 
         // Create my node -- then it should be visibale to others
         // NB error should not happen here - but shoud check
@@ -118,56 +107,82 @@ impl Cluster {
                 zk: zk,
                 client_id : Self::sequence_no(&s).unwrap()
             };
-            c.init_watch_children();
-            c
+
+            c.children_changed();
+            let arc = Arc::clone(&CLUSTER);
+            let mut mg = arc.lock().unwrap();
+            mg.replace(c);
+
+            
+
         } else {
-            panic!();
+            panic!("Failed to initialize Zookeeper client");
         }
         
     }
 
 
     /// How to set self in context?? Use a closure
-    fn list_children(children: Vec<String>) {
+    fn list_children(&self, children: Vec<String>) {
         info!("Listing children");
         for c in &children {
-            info!("Child of {}, sequence is {:?} ",c, Self::sequence_no(c));
+            let seq = Self::sequence_no(c);
+            if let Some(x) = seq {
+                if x == self.client_id {
+                    info!("Child of {}, sequence is {:?} **** ME !!", c, x);
+                } else {
+                    info!("Child of {}, sequence is {:?} ", c, x);
+                }
+
+            }
         }
         // now need to re-watch
     }
 
-    // Careful of the "move" here
-    fn restart_watch_children(zk: Arc<ZooKeeper>, event: WatchedEvent) {
-        debug!("{:?} Restarting watch", std::thread::current().name());
 
-        match event.event_type {
-            WatchedEventType::NodeChildrenChanged => debug!("Children of membership/leader-election node changed"),
-            _ => debug!("Other event type"),
-        }
+    fn children_changed(&self) {
+        let children = self.zk.get_children_w(&self.zk_path , Self::zz_children_changed) ;
 
-        let zk2 = zk.clone();
-        let children = zk.get_children_w("/my_cool_cluster" , LoggingWatcher::cluster_member_node) ; // move |e: WatchedEvent| Self::restart_watch_children(zk2.clone(), e) );
         match children {
-            Ok(v) => Self::list_children(v),
+            Ok(v) => self.list_children(v),
             Err( x ) => error!("Failed to get children of  {:?}", x),
         };
+
     }
 
-    // TODO: like the above example .. check 
-    fn init_watch_children(&self) {
-        let zk = self.zk.clone();
-        let children = self.zk.get_children_w(&self.zk_path,  move |e: WatchedEvent| Self::restart_watch_children(zk.clone(), e) );
-        // let children = self.zk.get_children(&self.zk_path,  true );
-        match children {
-            Ok(v) => Self::list_children(v),
-            Err( x ) => error!("Failed to get children of {}  {:?}", self.zk_path, x),
-        };
+
+
+    ///
+    fn zz_children_changed(event: WatchedEvent) {
+
+        match &event.event_type {
+            WatchedEventType::NodeChildrenChanged => info!("Children has changed"),
+            _ => {},
+        }
+
+
+        debug!("zz_children changed");
+
+        // get ref to singleton
+        let arc = Arc::clone(&CLUSTER);
+        let opt = arc.lock().unwrap();
+        let cluster = opt.as_ref().unwrap(); // TODO: check for singleton
+        
+
+        // we can get the path from the Cluster now
+        cluster.children_changed();
+        
     }
     
 
     ///
     fn sequence_no(s: &str) -> Option<u32> {
-        Self::sequence_no_2(s)
+        // Example of above code re-written using combinator functions on Option and error!
+        // A good learning example I think - check number of lines of code with below
+        s.rfind('_')
+            .map( |idx| s.split_at(idx+1).1)
+            .map( |substr| u32::from_str(substr).ok() )
+            .flatten()
         // if let Some(idx) = s.rfind('_') {
         //     match u32::from_str(s.split_at(idx+1).1) {
         //         Ok(i) => Some(i),
@@ -178,17 +193,6 @@ impl Cluster {
         // }
     }
 
-    // Example of above code re-written using combinator functions on Option and error!
-    // A good learning example I think
-    fn sequence_no_2(s: &str) -> Option<u32> {
-        s.rfind('_')
-            .map( |idx| s.split_at(idx+1).1)
-            .map( |substr| u32::from_str(substr).ok() )
-            .flatten()
-    }
 
-        // // we've got basic setup .. we can look at the node and get the children && watch it !!
-    // // let children = zk.get_children_w("/roger", |evnt: WatchedEvent| {
-    // // });
 
 }
