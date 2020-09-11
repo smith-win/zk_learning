@@ -22,7 +22,7 @@ fn main() {
 
     // This does not return anything, .. 
     // TODO: consider builder pattern here / re-try if ZK unavailable etc etc
-    Cluster::new("my_cool_cluster");
+    Cluster::new("soggy-bottom");
 
     for i in 1..20 {
         info!("main thread sleeping... {}",i);

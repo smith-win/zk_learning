@@ -21,6 +21,10 @@ Generic Application Cluster Module
     -- but leader calls to local no different to remote (think of how to do that)
 
 
+    .. list children
+        .. if I am leader, watch children
+        .. if I am not leader watch my previous in succession list
+
 
 e.g start app
     

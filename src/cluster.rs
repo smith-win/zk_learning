@@ -43,7 +43,9 @@ pub struct Cluster {
     /// Zk instance used
     zk: ZooKeeper,
 
-    pub client_id: u32
+    pub client_id: u32,
+
+    leader: bool,
 
 }
 
@@ -102,18 +104,22 @@ impl Cluster {
 
         // From the node, get the generated sequence
         if let Ok(s) = my_path {
-            let c = Cluster {
+
+            // initial children grab
+            let children = zk.get_children(&path, false).unwrap() ;
+
+            let mut c = Cluster {
                 zk_path: path,
                 zk: zk,
-                client_id : Self::sequence_no(&s).unwrap()
+                client_id : Self::sequence_no(&s).unwrap(),
+                leader: false
             };
 
-            c.children_changed();
+            // Leadership check etc
+            c.list_children(children);
             let arc = Arc::clone(&CLUSTER);
             let mut mg = arc.lock().unwrap();
             mg.replace(c);
-
-            
 
         } else {
             panic!("Failed to initialize Zookeeper client");
@@ -123,24 +129,59 @@ impl Cluster {
 
 
     /// How to set self in context?? Use a closure
-    fn list_children(&self, children: Vec<String>) {
+    fn list_children(&mut self, children: Vec<String>) {
         info!("Listing children");
-        for c in &children {
+
+        // This is the sequence number of the node we are watching
+
+        // can use enumerate to get index of minimum ?
+
+        let mut my_watched : Option<(u32, usize, &String)> = None;
+
+
+        // TODO: can use "fold" here
+        for (idx, c) in children.iter().enumerate() {
             let seq = Self::sequence_no(c);
             if let Some(x) = seq {
+                
                 if x == self.client_id {
                     info!("Child of {}, sequence is {:?} **** ME !!", c, x);
+                } else if x < self.client_id {
+                    info!("Child of {}, sequence is {:?} ", c, x);
+
+                    // my_watched.replace(std::cmp::max(my_watched.unwrap_or((x), x));
+                    if let Some(pair) = my_watched {
+                        if dbg!(x > pair.0) {
+                            my_watched.replace( (x, idx, c));
+                        }
+                    } else {
+                        my_watched.replace( (x, idx, c));
+                    }
+
                 } else {
                     info!("Child of {}, sequence is {:?} ", c, x);
                 }
-
             }
         }
+        
         // now need to re-watch
+        if let Some(x) = my_watched {
+            self.leader = false;
+            let watching_path = format!("{}/{}", self.zk_path, x.2);
+            info!("I will be watching {} -- {}", x.0, watching_path);
+            let _x = self.zk.exists_w(&watching_path, Self::zz_watched_changed);
+        } else {
+            self.leader = true;
+            info!("I am the leader!");
+            // only the leader watches children
+            let _x = self.zk.get_children_w(&self.zk_path , Self::zz_children_changed) ;
+        }
+        
     }
 
 
-    fn children_changed(&self) {
+    /// Called when the list of children has changed
+    fn children_changed(&mut self) {
         let children = self.zk.get_children_w(&self.zk_path , Self::zz_children_changed) ;
 
         match children {
@@ -151,29 +192,49 @@ impl Cluster {
     }
 
 
-
-    ///
-    fn zz_children_changed(event: WatchedEvent) {
-
-        match &event.event_type {
-            WatchedEventType::NodeChildrenChanged => info!("Children has changed"),
-            _ => {},
-        }
-
-
-        debug!("zz_children changed");
-
+    // "static" func to check leadership / children 
+    fn zz_check_leadership() {
         // get ref to singleton
         let arc = Arc::clone(&CLUSTER);
-        let opt = arc.lock().unwrap();
-        let cluster = opt.as_ref().unwrap(); // TODO: check for singleton
+        let mut opt = arc.lock().unwrap();
         
-
+        let cluster = opt.as_mut();
+        
         // we can get the path from the Cluster now
-        cluster.children_changed();
+        match cluster {
+            Some(x) =>  x.children_changed(),
+            _ => {},
+        }
+    }
+
+
+    /// Called when all the children hav changed
+    fn zz_children_changed(event: WatchedEvent) {
+        debug!("zz_children changed");
+
+        match &event.event_type {
+            WatchedEventType::NodeChildrenChanged => {
+                info!("Children has changed");
+                Self::zz_check_leadership();
+            },
+            _ => {},
+        }
         
     }
     
+
+    /// Called when the watched child is deleted .. we have to then
+    /// check for leader status and watch potential leader
+    fn zz_watched_changed(event: WatchedEvent) {
+        match &event.event_type {
+            WatchedEventType::NodeDeleted => {
+                info!("Watched node has been deleted!");
+                Self::zz_check_leadership();
+            }
+            _ => {},
+        }
+    }
+
 
     ///
     fn sequence_no(s: &str) -> Option<u32> {
