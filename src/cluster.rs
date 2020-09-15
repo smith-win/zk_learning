@@ -67,6 +67,9 @@ impl Watcher for LoggingWatcher {
 
 impl Cluster {
 
+    // Simple case would be to have a loop which tries every 10s or 
+    // so for a ZK cluster to be running
+
     // TODO: configurable address, timeout option, application (logical cluster name)
     // TODO: should get a result
     /// Creates a new instance, returns an Arc to it - so it can be used
@@ -74,7 +77,7 @@ impl Cluster {
         debug!("{:?} Attemping to join cluster [{}]",std::thread::current().name(), &cluster);
 
         // TODO: we want to manage this as part of "Cluster" code - run asynchronously ?  Use calls
-        let zk = ZooKeeper::connect("127.0.0.1:2181", Duration::from_millis(100), LoggingWatcher{} ).unwrap();
+        let zk = ZooKeeper::connect("192.168.0.5:8080", Duration::from_millis(100), LoggingWatcher{} ).unwrap();
         zk.add_listener(|zk_state| info!("New ZkState is {:?}", zk_state));
 
         // Check for and create if missing the cluster node
@@ -105,7 +108,8 @@ impl Cluster {
         // From the node, get the generated sequence
         if let Ok(s) = my_path {
 
-            // initial children grab
+            // initial children grab 
+            // TODO: need to unwrap should not unwrap h
             let children = zk.get_children(&path, false).unwrap() ;
 
             let mut c = Cluster {
@@ -136,6 +140,7 @@ impl Cluster {
 
         // can use enumerate to get index of minimum ?
 
+        // index in array, the sequence number and the path
         let mut my_watched : Option<(u32, usize, &String)> = None;
 
 
