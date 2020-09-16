@@ -13,7 +13,6 @@ Generic Application Cluster Module
 
     If ok .. call back to app to initialise (Fn)
         .. if init ok .. status => Online, out of {Joining, Initializing, Online, Suspect}
-
     
 
 4) "Leader" is a seperate object as far as code is concerned

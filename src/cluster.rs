@@ -73,17 +73,17 @@ impl Cluster {
     // TODO: configurable address, timeout option, application (logical cluster name)
     // TODO: should get a result
     /// Creates a new instance, returns an Arc to it - so it can be used
-    pub fn new(cluster: &str ) {
-        debug!("{:?} Attemping to join cluster [{}]",std::thread::current().name(), &cluster);
+    pub fn new(app_cluster_name: &str, zk_cluster: &str ) {
+        debug!("{:?} Attemping to join cluster [{}]",std::thread::current().name(), &app_cluster_name);
 
         // TODO: we want to manage this as part of "Cluster" code - run asynchronously ?  Use calls
-        let zk = ZooKeeper::connect("192.168.0.5:8080", Duration::from_millis(100), LoggingWatcher{} ).unwrap();
+        let zk = ZooKeeper::connect(zk_cluster, Duration::from_millis(100), LoggingWatcher{} ).unwrap();
         zk.add_listener(|zk_state| info!("New ZkState is {:?}", zk_state));
 
         // Check for and create if missing the cluster node
         let mut path = String::new();
         path += "/";
-        path += cluster;
+        path += app_cluster_name;
 
         let create_result = zk.create(path.as_str(), vec![], Acl::open_unsafe().clone(), CreateMode::Persistent);
         if let Err(x) = create_result {
