@@ -33,9 +33,19 @@ e.g start app
         Cluster -- status to Joining
             .. create cluster path if not exists .. easy peasy    
 
+## Scaling disk access 
+https://www.gridgain.com/resources/blog/how-boost-and-scale-postgresql-shared-buffers-in-memory-data-grids
 
 
+## on my machine I can run Zookeeper by using Podman
+
+# Standard port mapping
+podman run -t -i -p 2181:2181 zookeeper
+
+# Through port 8080 .. 
+podman run -t -i -p 8080:2181 zookeeper
 
 
-
+# Then run with this command
+APP_LOG=debug cargo run --release -- --cluster myapp --host $(hostname)
 

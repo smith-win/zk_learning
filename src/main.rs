@@ -49,7 +49,8 @@ fn main() {
 
     // This does not return anything, .. 
     // TODO: consider builder pattern here / re-try if ZK unavailable etc etc
-    Cluster::new(&options.cluster_name, &options.zk);
+    let my_leadership_ops = Banana{};
+    Cluster::new(&options.cluster_name, &options.zk, my_leadership_ops);
 
     for i in 1..20 {
         info!("main thread sleeping... {}",i);
@@ -57,3 +58,20 @@ fn main() {
     }
 
 }
+
+/// A silly implemenation of a cluster leader call back
+pub struct Banana{}
+
+
+impl cluster::ClusterLeader for Banana {
+
+
+    fn cluster_changed(&mut self, members: &Vec<String>) {
+        for s in members {
+            info!("[Custom Callback] Member: {}", s);
+        }
+    }
+
+}
+
+

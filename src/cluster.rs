@@ -43,11 +43,30 @@ pub struct Cluster {
     /// Zk instance used
     zk: ZooKeeper,
 
+    /// id of myself in the cluster
     pub client_id: u32,
 
+    /// indicates if this process is the leader
     leader: bool,
 
+    /// Call back to custom leader operations, boxed as we don't know
+    /// type until runtime
+    leader_ops : Box<dyn ClusterLeader>
+
 }
+
+/// Defines the operations that enable a cluster leader to do
+/// e.g send responsibilities or instructions to each cluster member.
+/// It must be "Send" because we can call it on any thread - hence we can use in the static
+pub trait ClusterLeader: Send {
+
+    /// When the cluster changes, we inform the leader.
+    /// We provide the set of members, and their configuration key
+    fn cluster_changed(&mut self, members: &Vec<String>);
+
+}
+
+
 
 
 /// Copied from example code, not sure of use as never seems to log anything!
@@ -73,7 +92,7 @@ impl Cluster {
     // TODO: configurable address, timeout option, application (logical cluster name)
     // TODO: should get a result
     /// Creates a new instance, returns an Arc to it - so it can be used
-    pub fn new(app_cluster_name: &str, zk_cluster: &str ) {
+    pub fn new<T: ClusterLeader + 'static>(app_cluster_name: &str, zk_cluster: &str, leader_ops: T ) {
         debug!("{:?} Attemping to join cluster [{}]",std::thread::current().name(), &app_cluster_name);
 
         // TODO: we want to manage this as part of "Cluster" code - run asynchronously ?  Use calls
@@ -116,7 +135,8 @@ impl Cluster {
                 zk_path: path,
                 zk: zk,
                 client_id : Self::sequence_no(&s).unwrap(),
-                leader: false
+                leader: false,
+                leader_ops: Box::new(leader_ops)
             };
 
             // Leadership check etc
@@ -181,6 +201,10 @@ impl Cluster {
             // only the leader watches children
             let _x = self.zk.get_children_w(&self.zk_path , Self::zz_children_changed) ;
         }
+
+        // call our custom call back to ensure its working
+        self.leader_ops.cluster_changed(&children);
+
         
     }
 
