@@ -1,7 +1,7 @@
 ///! Module for defining the cluster operations, and detecting
 ///! if I am leader (or who is leader)
 
-
+use std::collections::HashMap;
 use std::time::Duration;
 use std::sync::{Arc, Mutex};
 use std::str::FromStr;
@@ -49,6 +49,10 @@ pub struct Cluster {
     /// indicates if this process is the leader
     leader: bool,
 
+    /// Maps the client id to (node_info, node_responsibility)
+    /// Only the leader needs this
+    member_config: Option<HashMap<u32, (String, String)>>,
+
     /// Call back to custom leader operations, boxed as we don't know
     /// type until runtime
     leader_ops : Box<dyn ClusterLeader>
@@ -60,9 +64,22 @@ pub struct Cluster {
 /// It must be "Send" because we can call it on any thread - hence we can use in the static
 pub trait ClusterLeader: Send {
 
+    /// Each node in a cluster can have a data type associated with it.
+    /// This tells the Node what they are responsible for
+    // type NodeData;
+
+    // TODO: we could provide added & removed lists ?
+    /// Called on the leader -- a chance to setup the cluster and inform
+    /// each client what they are responsible for
     /// When the cluster changes, we inform the leader.
     /// We provide the set of members, and their configuration key
     fn cluster_changed(&mut self, members: &Vec<String>);
+
+    /// Called on members -- they can provide information about themselves
+    /// typically how thay can be contacted (e.g base URI of service they expose)
+    fn member_contact_info(&self) -> &str;
+
+    fn member_responsibility(&self, resp: &str);
 
 }
 
@@ -104,7 +121,7 @@ impl Cluster {
         path += "/";
         path += app_cluster_name;
 
-        let create_result = zk.create(path.as_str(), vec![], Acl::open_unsafe().clone(), CreateMode::Persistent);
+        let create_result = zk.create(path.as_str(),  vec![], Acl::open_unsafe().clone(), CreateMode::Persistent);
         if let Err(x) = create_result {
             match x {
                 ZkError::NodeExists => info!("Node {} already exists - no need to create", path),
@@ -119,28 +136,32 @@ impl Cluster {
         // NB error should not happen here - but shoud check
         let mut member_path = path.clone();
         member_path += "/member_";
+
+        // Get the contact data for this instance of a node
+        let my_contact_info = leader_ops.member_contact_info();
+        let vec = dbg!(Vec::from(my_contact_info.as_bytes()));
+
         let my_path = zk.create(&member_path,
-            vec![], // try zero length vec of data .. i.e .. no data!
+            vec, 
             Acl::open_unsafe().clone(),
             CreateMode::EphemeralSequential);
 
+        let cluster_member_paths = zk.get_children(&path, false).unwrap() ;
+
         // From the node, get the generated sequence
         if let Ok(s) = my_path {
-
-            // initial children grab 
-            // TODO: need to unwrap should not unwrap h
-            let children = zk.get_children(&path, false).unwrap() ;
 
             let mut c = Cluster {
                 zk_path: path,
                 zk: zk,
                 client_id : Self::sequence_no(&s).unwrap(),
                 leader: false,
-                leader_ops: Box::new(leader_ops)
+                leader_ops: Box::new(leader_ops),
+                member_config: None
             };
-
+            
             // Leadership check etc
-            c.list_children(children);
+            c.leadership_check(cluster_member_paths);
             let arc = Arc::clone(&CLUSTER);
             let mut mg = arc.lock().unwrap();
             mg.replace(c);
@@ -151,21 +172,21 @@ impl Cluster {
         
     }
 
-
     /// How to set self in context?? Use a closure
-    fn list_children(&mut self, children: Vec<String>) {
-        info!("Listing children");
+    fn leadership_check(&mut self, cluster_member_paths: Vec<String>) {
+        info!("leadership_check: listing members");
 
         // This is the sequence number of the node we are watching
 
         // can use enumerate to get index of minimum ?
 
         // index in array, the sequence number and the path
+        // TODO: is this tuple-tripe useful?
         let mut my_watched : Option<(u32, usize, &String)> = None;
 
 
         // TODO: can use "fold" here
-        for (idx, c) in children.iter().enumerate() {
+        for (idx, c) in cluster_member_paths.iter().enumerate() {
             let seq = Self::sequence_no(c);
             if let Some(x) = seq {
                 
@@ -186,6 +207,7 @@ impl Cluster {
                 } else {
                     info!("Child of {}, sequence is {:?} ", c, x);
                 }
+
             }
         }
         
@@ -196,25 +218,59 @@ impl Cluster {
             info!("I will be watching {} -- {}", x.0, watching_path);
             let _x = self.zk.exists_w(&watching_path, Self::zz_watched_changed);
         } else {
+            // No one found to watch, so we are the leader
             self.leader = true;
-            info!("I am the leader!");
-            // only the leader watches children
-            let _x = self.zk.get_children_w(&self.zk_path , Self::zz_children_changed) ;
+            info!("I am the leader");
+
+            // If we are newly promoted to leader, we need to get the member config
+            if self.member_config.is_none() {
+                info!("I am the newly elected Leader");
+
+                let mut member_conf : HashMap<u32, (String, String)> = HashMap::with_capacity(std::cmp::max(20, cluster_member_paths.len()));
+
+                // TODO: we need ro
+                cluster_member_paths.iter()
+                    .for_each(|p| {
+
+                        let full_node_path = format!("{}/{}", self.zk_path, p);
+                        let client_contact_info = self.zk.get_data(&full_node_path, false).map_or( None, |v| String::from_utf8(v.0).ok());
+                        
+                        let client_id = Self::sequence_no(p);
+                        if let  (Some(info), Some(id) )= (client_contact_info, client_id) {
+                            match member_conf.entry(id) {
+                                std::collections::hash_map::Entry::Vacant(e) => {
+                                    info!("NEW member joined: {} @ {}", e.key(), info);
+                                    e.insert((info, String::new()) );
+                                },
+                                _ => {},
+                            }
+
+                        } else {
+                            error!("Failed to get data? ");
+                        }
+                    });
+
+
+                // The leader always watches children, so we need to re-watch
+                let _x = self.zk.get_children_w(&self.zk_path , Self::zz_children_changed) ;
+
+            }
         }
 
         // call our custom call back to ensure its working
-        self.leader_ops.cluster_changed(&children);
-
+        self.leader_ops.cluster_changed(&cluster_member_paths);
         
     }
-
+    
 
     /// Called when the list of children has changed
     fn children_changed(&mut self) {
+
+        //
         let children = self.zk.get_children_w(&self.zk_path , Self::zz_children_changed) ;
 
         match children {
-            Ok(v) => self.list_children(v),
+            Ok(v) => self.leadership_check(v),
             Err( x ) => error!("Failed to get children of  {:?}", x),
         };
 
@@ -243,7 +299,7 @@ impl Cluster {
 
         match &event.event_type {
             WatchedEventType::NodeChildrenChanged => {
-                info!("Children has changed");
+                info!("Children have changed");
                 Self::zz_check_leadership();
             },
             _ => {},
