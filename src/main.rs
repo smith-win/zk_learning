@@ -69,13 +69,13 @@ pub struct ExampleClusterMember {
 }
 
 
-impl cluster::ClusterLeader for ExampleClusterMember {
+impl cluster::ClusterLocalNode for ExampleClusterMember {
 
 
-    fn cluster_changed(&mut self, members: &Vec<String>) {
+    fn leader_cluster_changed(&mut self, members: &Vec<String>) {
         for s in members {
 
-            info!("[Custom Callback] Member: {}", s);
+            info!("[Leader Ops] Member: {}", s);
         }
     }
 

@@ -55,14 +55,17 @@ pub struct Cluster {
 
     /// Call back to custom leader operations, boxed as we don't know
     /// type until runtime
-    leader_ops : Box<dyn ClusterLeader>
+    leader_ops : Box<dyn ClusterLocalNode>
 
 }
 
-/// Defines the operations that enable a cluster leader to do
+/// Defines the operations that enable a node to participate in the cluster
 /// e.g send responsibilities or instructions to each cluster member.
-/// It must be "Send" because we can call it on any thread - hence we can use in the static
-pub trait ClusterLeader: Send {
+/// It must be "Send" because we can call it on any thread - hence we can use in the static.
+/// Leader operations start iwth prefix "leader_".
+/// Member  operations start with prefix "member_"
+/// A node can be both leader and member
+pub trait ClusterLocalNode: Send {
 
     /// Each node in a cluster can have a data type associated with it.
     /// This tells the Node what they are responsible for
@@ -73,12 +76,13 @@ pub trait ClusterLeader: Send {
     /// each client what they are responsible for
     /// When the cluster changes, we inform the leader.
     /// We provide the set of members, and their configuration key
-    fn cluster_changed(&mut self, members: &Vec<String>);
+    fn leader_cluster_changed(&mut self, members: &Vec<String>);
 
     /// Called on members -- they can provide information about themselves
     /// typically how thay can be contacted (e.g base URI of service they expose)
     fn member_contact_info(&self) -> &str;
 
+    /// Called to set the responsibility on the local node
     fn member_responsibility(&self, resp: &str);
 
 }
@@ -109,7 +113,7 @@ impl Cluster {
     // TODO: configurable address, timeout option, application (logical cluster name)
     // TODO: should get a result
     /// Creates a new instance, returns an Arc to it - so it can be used
-    pub fn new<T: ClusterLeader + 'static>(app_cluster_name: &str, zk_cluster: &str, leader_ops: T ) {
+    pub fn new<T: ClusterLocalNode + 'static>(app_cluster_name: &str, zk_cluster: &str, leader_ops: T ) {
         debug!("{:?} Attemping to join cluster [{}]",std::thread::current().name(), &app_cluster_name);
 
         // TODO: we want to manage this as part of "Cluster" code - run asynchronously ?  Use calls
@@ -139,7 +143,7 @@ impl Cluster {
 
         // Get the contact data for this instance of a node
         let my_contact_info = leader_ops.member_contact_info();
-        let vec = dbg!(Vec::from(my_contact_info.as_bytes()));
+        let vec = Vec::from(my_contact_info.as_bytes());
 
         let my_path = zk.create(&member_path,
             vec, 
@@ -220,48 +224,62 @@ impl Cluster {
         } else {
             // No one found to watch, so we are the leader
             self.leader = true;
-            info!("I am the leader");
 
             // If we are newly promoted to leader, we need to get the member config
             if self.member_config.is_none() {
-                info!("I am the newly elected Leader");
-
-                let mut member_conf : HashMap<u32, (String, String)> = HashMap::with_capacity(std::cmp::max(20, cluster_member_paths.len()));
-
-                // TODO: we need ro
-                cluster_member_paths.iter()
-                    .for_each(|p| {
-
-                        let full_node_path = format!("{}/{}", self.zk_path, p);
-                        let client_contact_info = self.zk.get_data(&full_node_path, false).map_or( None, |v| String::from_utf8(v.0).ok());
-                        
-                        let client_id = Self::sequence_no(p);
-                        if let  (Some(info), Some(id) )= (client_contact_info, client_id) {
-                            match member_conf.entry(id) {
-                                std::collections::hash_map::Entry::Vacant(e) => {
-                                    info!("NEW member joined: {} @ {}", e.key(), info);
-                                    e.insert((info, String::new()) );
-                                },
-                                _ => {},
-                            }
-
-                        } else {
-                            error!("Failed to get data? ");
-                        }
-                    });
-
-
-                // The leader always watches children, so we need to re-watch
-                let _x = self.zk.get_children_w(&self.zk_path , Self::zz_children_changed) ;
-
+                info!("I have just been promoted to cluster leader");
+                self.member_config.replace( HashMap::with_capacity(std::cmp::max(20, cluster_member_paths.len())) );
+            } else {
+                info!("I am already the leader");
             }
+
+            &cluster_member_paths.iter()
+                .for_each(|p| {
+
+                    let full_node_path = format!("{}/{}", self.zk_path, p);
+                    let client_contact_info = self.zk.get_data(&full_node_path, false).map_or( None, |v| String::from_utf8(v.0).ok());
+                    
+                    let client_id = Self::sequence_no(p);
+                    if let  (Some(info), Some(id) )= (client_contact_info, client_id) {
+                        
+                        // a bit weird, I own it here (member_config)
+                        match self.member_config.as_mut().unwrap().entry(id) {
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                info!("NEW member joined: {} @ {}", e.key(), info);
+                                e.insert((info, String::new()) );
+                            },
+                            _ => {},
+                        }
+
+                    } else {
+                        error!("Failed to get data? ");
+                    }
+                });
+
+            // The leader always watches children, so we need to re-watch
+            let _x = self.zk.get_children_w(&self.zk_path , Self::zz_children_changed) ;
+
+        
         }
 
         // call our custom call back to ensure its working
-        self.leader_ops.cluster_changed(&cluster_member_paths);
+        self.leader_ops.leader_cluster_changed(&cluster_member_paths);
         
     }
     
+
+    // TODO: need some result to go on
+    /// Writes member config to the node, all members can then pick up
+    /// the partition data
+    fn write_member_data(&mut self) {
+
+        // build a simple string of the member configs so all can provide it.
+
+        let full_node_path = format!("{}/{}", self.zk_path, "member_data");
+        let client_contact_info = self.zk.get_data(&full_node_path, false).map_or( None, |v| String::from_utf8(v.0).ok());
+    }
+
+
 
     /// Called when the list of children has changed
     fn children_changed(&mut self) {
@@ -321,12 +339,13 @@ impl Cluster {
     }
 
 
-    ///
-    fn sequence_no(s: &str) -> Option<u32> {
+    /// Looks a the name of a node and returns the sequence number from it.
+    /// The sequence number is used in leadership election.
+    fn sequence_no(node_name: &str) -> Option<u32> {
         // Example of above code re-written using combinator functions on Option and error!
         // A good learning example I think - check number of lines of code with below
-        s.rfind('_')
-            .map( |idx| s.split_at(idx+1).1)
+        node_name.rfind('_')
+            .map( |idx| node_name.split_at(idx+1).1)
             .map( |substr| u32::from_str(substr).ok() )
             .flatten()
         // if let Some(idx) = s.rfind('_') {
@@ -338,7 +357,5 @@ impl Cluster {
         //     None
         // }
     }
-
-
 
 }
