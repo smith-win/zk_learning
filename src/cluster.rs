@@ -76,6 +76,7 @@ pub trait ClusterLocalNode: Send {
     /// each client what they are responsible for
     /// When the cluster changes, we inform the leader.
     /// We provide the set of members, and their configuration key
+    // TODO: add return method here -- Map<String> ?  So we can get the responsibilities
     fn leader_cluster_changed(&mut self, members: &Vec<String>);
 
     /// Called on members -- they can provide information about themselves
@@ -233,6 +234,10 @@ impl Cluster {
                 info!("I am already the leader");
             }
 
+            // The cluster has changed, and this instance of the app is the leader.
+            // We now build the map of node Id and their corresponding "info" ..
+            // which allows us to contact them.
+            // TODO: Once this map is built, we need to calculate the reponsibilities.
             &cluster_member_paths.iter()
                 .for_each(|p| {
 
@@ -258,8 +263,6 @@ impl Cluster {
 
             // The leader always watches children, so we need to re-watch
             let _x = self.zk.get_children_w(&self.zk_path , Self::zz_children_changed) ;
-
-        
         }
 
         // call our custom call back to ensure its working
