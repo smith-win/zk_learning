@@ -2,6 +2,7 @@
 ///! if I am leader (or who is leader)
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::time::Duration;
 use std::sync::{Arc, Mutex};
 use std::str::FromStr;
@@ -72,12 +73,15 @@ pub trait ClusterLocalNode: Send {
     // type NodeData;
 
     // TODO: we could provide added & removed lists ?
+    // NB - lifetime annotations - the returned &str should be one of the references
+    // passed in (list of memers).  We help the compiler here by letting it know this.
+    // (the responsibily is not passed in)
     /// Called on the leader -- a chance to setup the cluster and inform
     /// each client what they are responsible for
     /// When the cluster changes, we inform the leader.
     /// We provide the set of members, and their configuration key
-    // TODO: add return method here -- Map<String> ?  So we can get the responsibilities
-    fn leader_cluster_changed(&mut self, members: &Vec<String>);
+    /// Returns list of the responsibilties - in order responsibility -> node_id (could be list)
+    fn leader_cluster_changed<'a>(&mut self, members: u16) -> Vec<String>;
 
     /// Called on members -- they can provide information about themselves
     /// typically how thay can be contacted (e.g base URI of service they expose)
@@ -166,6 +170,7 @@ impl Cluster {
             };
             
             // Leadership check etc
+            info!("New-node - initial leadership check");
             c.leadership_check(cluster_member_paths);
             let arc = Arc::clone(&CLUSTER);
             let mut mg = arc.lock().unwrap();
@@ -179,8 +184,6 @@ impl Cluster {
 
     /// How to set self in context?? Use a closure
     fn leadership_check(&mut self, cluster_member_paths: Vec<String>) {
-        info!("leadership_check: listing members");
-
         // This is the sequence number of the node we are watching
 
         // can use enumerate to get index of minimum ?
@@ -196,13 +199,12 @@ impl Cluster {
             if let Some(x) = seq {
                 
                 if x == self.client_id {
-                    info!("Child of {}, sequence is {:?} **** ME !!", c, x);
+                    info!("Node {}, sequence is {:?} **** ME !!", c, x);
                 } else if x < self.client_id {
-                    info!("Child of {}, sequence is {:?} ", c, x);
+                    info!("Node {}, sequence is {:?} ", c, x);
 
-                    // my_watched.replace(std::cmp::max(my_watched.unwrap_or((x), x));
                     if let Some(pair) = my_watched {
-                        if dbg!(x > pair.0) {
+                        if x > pair.0  {
                             my_watched.replace( (x, idx, c));
                         }
                     } else {
@@ -215,7 +217,7 @@ impl Cluster {
 
             }
         }
-        
+
         // now need to re-watch
         if let Some(x) = my_watched {
             self.leader = false;
@@ -247,13 +249,16 @@ impl Cluster {
                     let client_id = Self::sequence_no(p);
                     if let  (Some(info), Some(id) )= (client_contact_info, client_id) {
                         
+                        // This doesn't work?
                         // a bit weird, I own it here (member_config)
                         match self.member_config.as_mut().unwrap().entry(id) {
-                            std::collections::hash_map::Entry::Vacant(e) => {
+                            Entry::Vacant(e) => {
                                 info!("NEW member joined: {} @ {}", e.key(), info);
                                 e.insert((info, String::new()) );
                             },
-                            _ => {},
+                            Entry::Occupied(e) => {
+                                info!("Existing member ? {} @ {}", e.key(), info);
+                            },
                         }
 
                     } else {
@@ -263,32 +268,26 @@ impl Cluster {
 
             // The leader always watches children, so we need to re-watch
             let _x = self.zk.get_children_w(&self.zk_path , Self::zz_children_changed) ;
+                
+            // call our custom call back to ensure its working
+            info!("leadership_check: there are {} members", cluster_member_paths.len());
+            let v = self.leader_ops.leader_cluster_changed(cluster_member_paths.len() as u16 );
+            info!("No. of node responsibilities: {}", v.len());
+            
+            for resp in v {
+                info!("Responsibility {} is node (todo)", resp);
+            }
         }
-
-        // call our custom call back to ensure its working
-        self.leader_ops.leader_cluster_changed(&cluster_member_paths);
         
     }
     
 
-    // TODO: need some result to go on
-    /// Writes member config to the node, all members can then pick up
-    /// the partition data
-    fn write_member_data(&mut self) {
-
-        // build a simple string of the member configs so all can provide it.
-
-        let full_node_path = format!("{}/{}", self.zk_path, "member_data");
-        let client_contact_info = self.zk.get_data(&full_node_path, false).map_or( None, |v| String::from_utf8(v.0).ok());
-    }
-
-
-
     /// Called when the list of children has changed
     fn children_changed(&mut self) {
 
-        //
-        let children = self.zk.get_children_w(&self.zk_path , Self::zz_children_changed) ;
+        //let children = self.zk.get_children_w(&self.zk_path , Self::zz_children_changed) ;
+        // Don't set a watch, as don;t know whether we'll lead or not
+        let children = self.zk.get_children(&self.zk_path, false) ;
 
         match children {
             Ok(v) => self.leadership_check(v),
@@ -314,18 +313,16 @@ impl Cluster {
     }
 
 
-    /// Called when all the children hav changed
+    /// Called when all the children have changed
     fn zz_children_changed(event: WatchedEvent) {
         debug!("zz_children changed");
 
         match &event.event_type {
             WatchedEventType::NodeChildrenChanged => {
-                info!("Children have changed");
                 Self::zz_check_leadership();
             },
             _ => {},
         }
-        
     }
     
 

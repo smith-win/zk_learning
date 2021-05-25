@@ -53,8 +53,8 @@ fn main() {
     let my_leadership_ops = ExampleClusterMember{ rest_endpoint: my_url };
     Cluster::new(&options.cluster_name, &options.zk, my_leadership_ops);
 
-    for i in 1..20 {
-        info!("main thread sleeping... {}",i);
+    for _i in 1..20 {
+        //info!("main thread sleeping... {}",i);
         std::thread::sleep(Duration::from_secs(10));
     }
 
@@ -68,15 +68,20 @@ pub struct ExampleClusterMember {
 
 }
 
-
+/// Implement the cluster
 impl cluster::ClusterLocalNode for ExampleClusterMember {
 
 
-    fn leader_cluster_changed(&mut self, members: &Vec<String>) {
-        for s in members {
-
-            info!("[Leader Ops] Member: {}", s);
+    fn leader_cluster_changed<'a>(&mut self, n: u16) -> Vec<String> {
+        // In this case, we pretend each node looks after 500k records each
+        // simple example, but shows how it works
+        let mut responsibilities:Vec<String> = Vec::with_capacity(n as usize);
+        let mut range_lower = 0;
+        for _s in 0..n {
+            responsibilities.push( format!("{}-{}", range_lower, range_lower+500000-1) );
+            range_lower += 500000;
         }
+        responsibilities
     }
 
     fn member_contact_info(&self) -> &str {
@@ -85,7 +90,7 @@ impl cluster::ClusterLocalNode for ExampleClusterMember {
 
 
     fn member_responsibility(&self, resp: &str) {
-        info!("My responsibilty has been set to [{}]", resp);
+        info!("My responsibiltiy has been set to [{}]", resp);
     }
 
 
