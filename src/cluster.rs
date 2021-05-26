@@ -204,7 +204,15 @@ impl Cluster {
             self.leader = false;
             let watching_path = format!("{}/members/{}", self.zk_path, x.2);
             info!("I will be watching {} -- {}", x.0, watching_path);
+
+            // FIXME: we've ignored error here
             let _x = self.zk.exists_w(&watching_path, Self::zz_watched_changed);
+            
+            if let Ok(data) = self.zk.get_data_w(&format!("{}/resps", self.zk_path), Self::zz_resps_changed) {
+                let s = String::from_utf8(data.0).unwrap();
+                info!("Member received this cluster data: {}", s);
+            }
+
         } else {
             // No one found to watch, so we are the leader
             if self.leader == true {
@@ -306,14 +314,27 @@ impl Cluster {
             // because it watches the entire path for members, if we put the cluster info here, 
             // it then causes the next watch to fire and so on and so forth!
             if let Some(node_data) = opt {
-                info!("Creating resps node");
+                info!("Creating resps node {}", &resp_zk_path);
                 self.zk.set_data(&resp_zk_path, bytes, Some(node_data.version));
             } else {
-                info!("Updating resps node");
-                self.zk.create(&resp_zk_path, bytes, Acl::open_unsafe().clone(), CreateMode::EphemeralSequential);
+                info!("Updating resps node {}", &resp_zk_path);
+                self.zk.create(&resp_zk_path, bytes, Acl::open_unsafe().clone(), CreateMode::Ephemeral);
             }
             info!("Updated member data");
         }
+
+    }
+
+
+    /// We must be a member rather than leader, read latest responsibilities
+    fn responsibilities_changed(&mut self) {
+
+        // TODO: error handling
+        if let Ok(data) = self.zk.get_data_w(&format!("{}/resps", self.zk_path), Self::zz_resps_changed) {
+            let s = String::from_utf8(data.0).unwrap();
+            info!("responsibilities_changed --member received this cluster data:\n{}", s);
+        }
+
 
     }
 
@@ -372,6 +393,31 @@ impl Cluster {
             _ => {},
         }
     }
+
+
+    /// Function called when we've detected change in responsibilties
+    fn zz_resps_changed(event: WatchedEvent) {
+
+        match &event.event_type {
+            WatchedEventType::NodeDataChanged => {}
+            _ => return,
+        }
+
+        // get ref to singleton
+        let arc = Arc::clone(&CLUSTER);
+        let mut opt = arc.lock().unwrap();
+        
+        let cluster = opt.as_mut();
+        
+        // we can get the path from the Cluster now
+        match cluster {
+            Some(x) => x.responsibilities_changed(),
+            _ => {},
+        }
+
+        
+    }
+
 
     /// Looks a the name of a node and returns the sequence number from it.
     /// The sequence number is used in leadership election.
