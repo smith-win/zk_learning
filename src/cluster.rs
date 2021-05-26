@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::str::FromStr;
 use zookeeper::{ZooKeeper, Watcher, WatchedEvent, CreateMode, Acl, ZkError, WatchedEventType};
 
+use std::io::{BufRead, Cursor};
 
 // Callbacks from watches require static scope, we use this singleton to
 // hold singleton in thread safe manner
@@ -24,7 +25,10 @@ pub struct Cluster {
     zk: ZooKeeper,
 
     /// id of myself in the cluster
-    pub client_id: u32,
+    client_id: u32,
+
+    /// What is the local node responsible for
+    local_responsibility: Option<String>,
 
     /// indicates if this process is the leader
     leader: bool,
@@ -145,6 +149,7 @@ impl Cluster {
                 zk_path: path,
                 zk: zk,
                 client_id : Self::sequence_no(&s).unwrap(),
+                local_responsibility: None,
                 leader: false,
                 leader_ops: Box::new(leader_ops),
                 member_config: HashMap::with_capacity(std::cmp::max(20, cluster_member_paths.len()))
@@ -207,11 +212,9 @@ impl Cluster {
 
             // FIXME: we've ignored error here
             let _x = self.zk.exists_w(&watching_path, Self::zz_watched_changed);
-            
-            if let Ok(data) = self.zk.get_data_w(&format!("{}/resps", self.zk_path), Self::zz_resps_changed) {
-                let s = String::from_utf8(data.0).unwrap();
-                info!("Member received this cluster data: {}", s);
-            }
+
+            // Start watching responsibilties
+            self.read_and_watch_resps();
 
         } else {
             // No one found to watch, so we are the leader
@@ -222,22 +225,21 @@ impl Cluster {
             }
             self.leader = true;
 
-            // If we are newly promoted to leader, we need to get the member config
+            // We need to update the member config
+            let mut known_member_ids = vec![];
 
             // The cluster has changed, and this instance of the app is the leader.
             // We now build the map of node Id and their corresponding "info" ..
             // which allows us to contact them.
-            // Filte matches nodes' files, not, e.g responsibilty file, 
             &cluster_member_paths.iter()
-                //.filter(|p| { info!("Filter says [{}]", p); let x = p.starts_with("member_"); x} )
                 .for_each(|p| {
 
                     let full_node_path = format!("{}/members/{}", self.zk_path, p);
                     let client_contact_info = self.zk.get_data(&full_node_path, false).map_or( None, |v| String::from_utf8(v.0).ok());
                     
                     let client_id = Self::sequence_no(p);
-                    if let  (Some(info), Some(id) )= (client_contact_info, client_id) {
-                        
+                    if let (Some(info), Some(id) )= (client_contact_info, client_id) {
+                        known_member_ids.push(id);
                         // This doesn't work?
                         // a bit weird, I own it here (member_config)
                         match self.member_config.entry(id) {
@@ -254,6 +256,9 @@ impl Cluster {
                         error!("Failed to get data? ");
                     }
                 });
+            
+            // remove from the member config any dropped nodes (we didn't see above)
+            self.member_config.retain( |k, _| known_member_ids.contains(k) );
 
             // The leader always watches children, so we need to re-watch
             let _x = self.zk.get_children_w(&format!("{}/members", &self.zk_path) , Self::zz_children_changed) ;
@@ -264,10 +269,11 @@ impl Cluster {
             info!("No. of node responsibilities: {}", v.len());
             
             self.assign_node_resps(v);
+            self.check_my_resp_changed();
         }
         
     }
-    
+
     /// Assigns (and re-assigns) responsibilities to nodes.   Aim is to 
     /// keep responsibilties on their current nodes if need be
     fn assign_node_resps(&mut self, resps: Vec<String> ) {
@@ -275,6 +281,12 @@ impl Cluster {
         for (key, val) in &self.member_config {
             info!("{}  -->  {:?} ", key, val);
         }
+
+
+        // 1: Responsibilties already assigned to nodes
+        // 2: New, unassigned responsibilies
+        // 3: Remove defunct nodes from the list
+
 
         for resp in resps {
             // try and find in current list
@@ -327,16 +339,56 @@ impl Cluster {
 
 
     /// We must be a member rather than leader, read latest responsibilities
-    fn responsibilities_changed(&mut self) {
+    fn read_and_watch_resps(&mut self) {
 
         // TODO: error handling
         if let Ok(data) = self.zk.get_data_w(&format!("{}/resps", self.zk_path), Self::zz_resps_changed) {
             let s = String::from_utf8(data.0).unwrap();
-            info!("responsibilities_changed --member received this cluster data:\n{}", s);
+
+            // Parse 
+            info!("responsibilities_changed -- member received this cluster data:\n{}", s);
+            
+            //
+            let cursor = Cursor::new(s);
+            self.member_config.clear();
+            // let mut xyz : Vec<(u32, String, String)> = vec![];
+            cursor.lines()
+                .filter_map( |x| x.map_or(None, |z| Some(z)))
+                .for_each(|line| {
+                    let v:Vec<&str> = line.splitn(3, '\t').collect();
+                    self.member_config.insert(
+                        u32::from_str(v[0]).unwrap(),
+                        (String::from(v[1]), String::from(v[2]))
+                    );
+                });
+
+                self.check_my_resp_changed();
         }
 
 
     }
+
+
+    /// If responsibilites have been amended, check against the local node 
+    /// issue command to change
+    fn check_my_resp_changed(&mut self) {
+
+        if let Some(assigned_resp) = self.member_config.get(&self.client_id) {
+            if self.local_responsibility.is_none() {
+                self.local_responsibility = Some(assigned_resp.1.clone());
+                info!("I have been assigned to [{:?}]",  self.local_responsibility );
+                self.leader_ops.member_responsibility(&assigned_resp.1 );
+            } else if let Some(ref current) = self.local_responsibility {
+                if *current != assigned_resp.1 {
+                    info!("Resp' changed from  [{:?}] to []", assigned_resp.1 );
+                    self.local_responsibility = Some(assigned_resp.1.clone());
+                    self.leader_ops.member_responsibility(&assigned_resp.1);
+                }
+            }
+        }
+
+    }
+
 
     /// Called when the list of children has changed
     fn children_changed(&mut self) {
@@ -397,11 +449,13 @@ impl Cluster {
 
     /// Function called when we've detected change in responsibilties
     fn zz_resps_changed(event: WatchedEvent) {
-
-        match &event.event_type {
-            WatchedEventType::NodeDataChanged => {}
-            _ => return,
-        }
+        info!("zz_resps_changed {:?}", event);
+        // Dont check event type, in case node is deleted, we'll wait for next leader
+        // to create it
+        // match &event.event_type {
+        //     WatchedEventType::NodeDataChanged | WatchedEventType::NodeCreated => {}
+        //     _ => return,
+        // }
 
         // get ref to singleton
         let arc = Arc::clone(&CLUSTER);
@@ -411,7 +465,7 @@ impl Cluster {
         
         // we can get the path from the Cluster now
         match cluster {
-            Some(x) => x.responsibilities_changed(),
+            Some(x) => x.read_and_watch_resps(),
             _ => {},
         }
 
