@@ -275,18 +275,34 @@ impl Cluster {
     }
 
     /// Assigns (and re-assigns) responsibilities to nodes.   Aim is to 
-    /// keep responsibilties on their current nodes if need be
-    fn assign_node_resps(&mut self, resps: Vec<String> ) {
+    /// keep responsibilties on their current nodes if need be "sticky" assignment
+    fn assign_node_resps(&mut self, mut resps: Vec<String> ) {
         
+        // for (key, val) in &self.member_config {
+        //     info!("BEFORE {} -->  {:?} ", key, val);
+        // }
+
+        // info!("Resp's remaining to assign: {:?}", resps);
+
+        // un-assign responsibilities from nodes, where the responsibility 
+        // no longer exists
+        for (_r, cfg) in &mut self.member_config {
+            if resps.iter().find( |&r| *r == cfg.1 ).is_none() {
+                cfg.1 = String::new();
+            }
+        }
         for (key, val) in &self.member_config {
-            info!("{}  -->  {:?} ", key, val);
+            info!("Remaining {} -->  {:?} ", key, val);
         }
 
+        // we've already removed nodes that no longer exist from the member config
 
-        // 1: Responsibilties already assigned to nodes
-        // 2: New, unassigned responsibilies
-        // 3: Remove defunct nodes from the list
+        // remove from list anything already assigned -- keeps the responsibilities "sticky"
+        resps.retain( |r| {
+            self.member_config.values().find( |cfg| &cfg.1 == r ).is_none()
+        });
 
+        info!("Resp's remaining to assign: {:?}", resps);
 
         for resp in resps {
             // try and find in current list
@@ -337,12 +353,33 @@ impl Cluster {
 
     }
 
+    fn wait_for_new_resps(&mut self) {
+        // FIXME: error handling
+        self.zk.get_children_w(&self.zk_path, Self::zz_check_resps_created);
+    }
+
+
+    fn zz_check_resps_created(event: WatchedEvent) {
+
+        // get ref to singleton
+        let arc = Arc::clone(&CLUSTER);
+        let mut opt = arc.lock().unwrap();
+        
+        if let Some(cluster) = opt.as_mut() {
+
+            match event.event_type {
+                WatchedEventType::NodeCreated | WatchedEventType::NodeChildrenChanged => cluster.read_and_watch_resps(),
+                _ => cluster.wait_for_new_resps(),
+            }
+        }
+    }
 
     /// We must be a member rather than leader, read latest responsibilities
     fn read_and_watch_resps(&mut self) {
 
-        // TODO: error handling
-        if let Ok(data) = self.zk.get_data_w(&format!("{}/resps", self.zk_path), Self::zz_resps_changed) {
+        // TODO: error handling - especially check if resps node does not exist
+        let result = self.zk.get_data_w(&format!("{}/resps", self.zk_path), Self::zz_resps_changed);
+        if let Ok(data) = result  {
             let s = String::from_utf8(data.0).unwrap();
 
             // Parse 
@@ -363,8 +400,14 @@ impl Cluster {
                 });
 
                 self.check_my_resp_changed();
+        } else if let Err(zk_err) = result {
+            error!("{:?}", zk_err);
+            // FIXME - error handing etc
+            match zk_err {
+                ZkError::NoNode => self.wait_for_new_resps(),
+                _ => {}, 
+            }
         }
-
 
     }
 
@@ -380,7 +423,7 @@ impl Cluster {
                 self.leader_ops.member_responsibility(&assigned_resp.1 );
             } else if let Some(ref current) = self.local_responsibility {
                 if *current != assigned_resp.1 {
-                    info!("Resp' changed from  [{:?}] to []", assigned_resp.1 );
+                    warn!("Resp' changed from  [{:?}] to [{:?}]", self.local_responsibility, assigned_resp.1 );
                     self.local_responsibility = Some(assigned_resp.1.clone());
                     self.leader_ops.member_responsibility(&assigned_resp.1);
                 }
@@ -411,12 +454,8 @@ impl Cluster {
         let arc = Arc::clone(&CLUSTER);
         let mut opt = arc.lock().unwrap();
         
-        let cluster = opt.as_mut();
-        
-        // we can get the path from the Cluster now
-        match cluster {
-            Some(x) => x.children_changed(),
-            _ => {},
+        if let Some(cluster) = opt.as_mut() {
+            cluster.children_changed();
         }
     }
 
@@ -457,19 +496,28 @@ impl Cluster {
         //     _ => return,
         // }
 
+        // When the leader dies, it will take the ephemeral node-responsibilities
+        // with it.  The new leader will recreate the node.  All other members
+        // receive a NodeDeletedEvent - we must then wait for the node to be re-created
+
+        // Cluster status is "unknown" - we've lost a node, so don't know which nodes
+        // are covering the responsibilities.  
+        // Need to wait for a leader to create a file
+
         // get ref to singleton
         let arc = Arc::clone(&CLUSTER);
         let mut opt = arc.lock().unwrap();
         
-        let cluster = opt.as_mut();
-        
         // we can get the path from the Cluster now
-        match cluster {
-            Some(x) => x.read_and_watch_resps(),
-            _ => {},
+        if let Some(cluster) = opt.as_mut() {
+            match &event.event_type {
+                WatchedEventType::NodeDeleted => {
+                    warn!("Responsibilities removed? {:?}",event.path);
+                    cluster.wait_for_new_resps();
+                },
+                _ => cluster.read_and_watch_resps(),
+            }
         }
-
-        
     }
 
 
