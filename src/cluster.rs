@@ -8,30 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::str::FromStr;
 use zookeeper::{ZooKeeper, Watcher, WatchedEvent, CreateMode, Acl, ZkError, WatchedEventType};
 
-// /// Refers to the state of an cluster member
-// pub enum ClusterStatus {
-
-//     /// Instance is attempting to join a cluster
-//     Joining,
-
-//     /// Instance is initializing, e.g. has received data from leader about it's partition / area of interest
-//     Initializing,
-
-//     /// Instance has initialized and is actively participating in cluster
-//     Active,
-
-//     /// Instance is suspect and should not be used
-//     Suspect
-// }
-
-// pub enum ClusterEvent {
-//     Joined,
-//     Leader,
-//     NewLeader
-// }
 
 // Callbacks from watches require static scope, we use this singleton to
-// hold a singleton
+// hold singleton in thread safe manner
 lazy_static! {
     static ref CLUSTER : Arc<Mutex<Option<Cluster>>> = Arc::new(Mutex::new(None));
 }
@@ -51,8 +30,8 @@ pub struct Cluster {
     leader: bool,
 
     /// Maps the client id to (node_info, node_responsibility)
-    /// Only the leader needs this
-    member_config: Option<HashMap<u32, (String, String)>>,
+    /// Leader publishes this, members read it
+    member_config: HashMap<u32, (String, String)>,
 
     /// Call back to custom leader operations, boxed as we don't know
     /// type until runtime
@@ -112,6 +91,19 @@ impl Watcher for LoggingWatcher {
 
 impl Cluster {
 
+    fn create_peristance_node(zk: &ZooKeeper, path: &str) {
+        let create_result = zk.create(path,  vec![], Acl::open_unsafe().clone(), CreateMode::Persistent);
+        if let Err(x) = create_result {
+            match x {
+                ZkError::NodeExists => info!("Node {} already exists - no need to create", path),
+                _ => panic!("Unhandled error"),   // TODO: we should be safe here and allow for re-try
+            }
+        } else {
+            info!("Node {} did not already exist and created succesfully", path);
+        }        
+    }
+
+
     // Simple case would be to have a loop which tries every 10s or 
     // so for a ZK cluster to be running
 
@@ -126,26 +118,15 @@ impl Cluster {
         zk.add_listener(|zk_state| info!("New ZkState is {:?}", zk_state));
 
         // Check for and create if missing the cluster node
-        let mut path = String::new();
-        path += "/";
-        path += app_cluster_name;
+        let path = format!("/{}", app_cluster_name);
+        Self::create_peristance_node(&zk, &path);
 
-        let create_result = zk.create(path.as_str(),  vec![], Acl::open_unsafe().clone(), CreateMode::Persistent);
-        if let Err(x) = create_result {
-            match x {
-                ZkError::NodeExists => info!("Node {} already exists - no need to create", path),
-                _ => panic!("Unhandled error"),   // TODO: we should be safe here and allow for re-try
-            }
-        } else {
-            info!("Node {} did not already exist and created succesfully", path);
-        }        
-        
+        Self::create_peristance_node(&zk, &format!("{}/members", path));
 
         // Create my node -- then it should be visibale to others
         // NB error should not happen here - but shoud check
-        let mut member_path = path.clone();
-        member_path += "/member_";
-
+        let member_path = format!("{}/members/member_", path);
+        
         // Get the contact data for this instance of a node
         let my_contact_info = leader_ops.member_contact_info();
         let vec = Vec::from(my_contact_info.as_bytes());
@@ -155,7 +136,7 @@ impl Cluster {
             Acl::open_unsafe().clone(),
             CreateMode::EphemeralSequential);
 
-        let cluster_member_paths = zk.get_children(&path, false).unwrap() ;
+        let cluster_member_paths = zk.get_children(&format!("{}/members", path), false).unwrap() ;
 
         // From the node, get the generated sequence
         if let Ok(s) = my_path {
@@ -166,7 +147,7 @@ impl Cluster {
                 client_id : Self::sequence_no(&s).unwrap(),
                 leader: false,
                 leader_ops: Box::new(leader_ops),
-                member_config: None
+                member_config: HashMap::with_capacity(std::cmp::max(20, cluster_member_paths.len()))
             };
             
             // Leadership check etc
@@ -221,29 +202,29 @@ impl Cluster {
         // now need to re-watch
         if let Some(x) = my_watched {
             self.leader = false;
-            let watching_path = format!("{}/{}", self.zk_path, x.2);
+            let watching_path = format!("{}/members/{}", self.zk_path, x.2);
             info!("I will be watching {} -- {}", x.0, watching_path);
             let _x = self.zk.exists_w(&watching_path, Self::zz_watched_changed);
         } else {
             // No one found to watch, so we are the leader
+            if self.leader == true {
+                info!("I am already the leader");
+            } else {
+                info!("I am **newly promoted** to leader");
+            }
             self.leader = true;
 
             // If we are newly promoted to leader, we need to get the member config
-            if self.member_config.is_none() {
-                info!("I have just been promoted to cluster leader");
-                self.member_config.replace( HashMap::with_capacity(std::cmp::max(20, cluster_member_paths.len())) );
-            } else {
-                info!("I am already the leader");
-            }
 
             // The cluster has changed, and this instance of the app is the leader.
             // We now build the map of node Id and their corresponding "info" ..
             // which allows us to contact them.
-            // TODO: Once this map is built, we need to calculate the reponsibilities.
+            // Filte matches nodes' files, not, e.g responsibilty file, 
             &cluster_member_paths.iter()
+                //.filter(|p| { info!("Filter says [{}]", p); let x = p.starts_with("member_"); x} )
                 .for_each(|p| {
 
-                    let full_node_path = format!("{}/{}", self.zk_path, p);
+                    let full_node_path = format!("{}/members/{}", self.zk_path, p);
                     let client_contact_info = self.zk.get_data(&full_node_path, false).map_or( None, |v| String::from_utf8(v.0).ok());
                     
                     let client_id = Self::sequence_no(p);
@@ -251,7 +232,7 @@ impl Cluster {
                         
                         // This doesn't work?
                         // a bit weird, I own it here (member_config)
-                        match self.member_config.as_mut().unwrap().entry(id) {
+                        match self.member_config.entry(id) {
                             Entry::Vacant(e) => {
                                 info!("NEW member joined: {} @ {}", e.key(), info);
                                 e.insert((info, String::new()) );
@@ -267,27 +248,81 @@ impl Cluster {
                 });
 
             // The leader always watches children, so we need to re-watch
-            let _x = self.zk.get_children_w(&self.zk_path , Self::zz_children_changed) ;
+            let _x = self.zk.get_children_w(&format!("{}/members", &self.zk_path) , Self::zz_children_changed) ;
                 
             // call our custom call back to ensure its working
             info!("leadership_check: there are {} members", cluster_member_paths.len());
             let v = self.leader_ops.leader_cluster_changed(cluster_member_paths.len() as u16 );
             info!("No. of node responsibilities: {}", v.len());
             
-            for resp in v {
-                info!("Responsibility {} is node (todo)", resp);
-            }
+            self.assign_node_resps(v);
         }
         
     }
     
+    /// Assigns (and re-assigns) responsibilities to nodes.   Aim is to 
+    /// keep responsibilties on their current nodes if need be
+    fn assign_node_resps(&mut self, resps: Vec<String> ) {
+        
+        for (key, val) in &self.member_config {
+            info!("{}  -->  {:?} ", key, val);
+        }
+
+        for resp in resps {
+            // try and find in current list
+            let node = self.member_config.iter_mut()
+                .find( |(_k, v)| *v.1 == resp);
+            
+            if let Some(x) = node {
+                info!("Responsibility {} already assigned to {:?}", resp, x);
+            } else {
+                // FIXME: logic does not work - test and see what happens when "gaps" appear
+                // find a free node and set there
+                if let Some(mut xx) = self.member_config.iter_mut().find( |(_k, v)| &*v.1 == "") {
+                    // This looks horrid, we get tuple (key, value) using the map, but our
+                    // valur is a tuple too!
+                    (xx.1).1 = resp;
+                    info!("Responsibility {:?} **newly** assigned", xx);
+                }
+            }
+        }
+
+        // Now we write the repsponsibility list out to the responsibility node so it's
+        // visible to all members
+        let resp_zk_path = format!("{}/resps", self.zk_path);
+
+        if let Ok(opt) = self.zk.exists(&resp_zk_path, false) {
+            // create string and vec it to write to 
+
+            let mut node_data = String::new();
+            for (k, v) in &self.member_config {
+                node_data += &format!("{}\t{}\t{}\n", k, v.0, v.1);
+            }
+
+            info!("\n{}", node_data);
+            let bytes = Vec::from(node_data.as_bytes());
+
+            // FIXME: error handling
+            // because it watches the entire path for members, if we put the cluster info here, 
+            // it then causes the next watch to fire and so on and so forth!
+            if let Some(node_data) = opt {
+                info!("Creating resps node");
+                self.zk.set_data(&resp_zk_path, bytes, Some(node_data.version));
+            } else {
+                info!("Updating resps node");
+                self.zk.create(&resp_zk_path, bytes, Acl::open_unsafe().clone(), CreateMode::EphemeralSequential);
+            }
+            info!("Updated member data");
+        }
+
+    }
 
     /// Called when the list of children has changed
     fn children_changed(&mut self) {
 
         //let children = self.zk.get_children_w(&self.zk_path , Self::zz_children_changed) ;
         // Don't set a watch, as don;t know whether we'll lead or not
-        let children = self.zk.get_children(&self.zk_path, false) ;
+        let children = self.zk.get_children(&format!("{}/members", &self.zk_path), false) ;
 
         match children {
             Ok(v) => self.leadership_check(v),
@@ -307,7 +342,7 @@ impl Cluster {
         
         // we can get the path from the Cluster now
         match cluster {
-            Some(x) =>  x.children_changed(),
+            Some(x) => x.children_changed(),
             _ => {},
         }
     }
@@ -337,7 +372,6 @@ impl Cluster {
             _ => {},
         }
     }
-
 
     /// Looks a the name of a node and returns the sequence number from it.
     /// The sequence number is used in leadership election.

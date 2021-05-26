@@ -5,6 +5,14 @@ Generic Application Cluster Module
 
 My TODO:
 
+--- Priority section
+
+* Write responsibilities to a zk node so cluster can get them
+    -- members read & watch the file
+    -- leader writes only
+
+* Test / fix when responsibilities appear -- make sure nodes cover them up
+
 * [DONE!] Only the leader watches the entire directory (stop herd effect)
     -- already done, but all nodes scan initally on startup to check if they should be leader
 
